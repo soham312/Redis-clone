@@ -56,6 +56,19 @@ func New(addr string, eng *engine.Engine) *Server {
 	}
 }
 
+// Addr returns the address ListenAndServe actually bound to, or nil if it
+// hasn't bound yet. Mainly useful for tests that listen on "127.0.0.1:0"
+// (an OS-assigned ephemeral port, so parallel test runs never collide on a
+// fixed port) and need to find out which port that turned out to be.
+func (s *Server) Addr() net.Addr {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.listener == nil {
+		return nil
+	}
+	return s.listener.Addr()
+}
+
 // ListenAndServe binds addr and serves connections until Shutdown is
 // called (in which case it returns nil) or a genuine accept error occurs.
 func (s *Server) ListenAndServe() error {
