@@ -21,13 +21,22 @@ package store
 // The tradeoff is pointer chasing (cache-unfriendly) and one extra word of
 // memory per entry for the `next` pointer — open addressing would win on
 // raw cache locality for small/simple value types.
-type entry struct {
+type entry[V any] struct {
 	key   string
-	value *Value
-	next  *entry
+	value V
+	next  *entry[V]
 }
 
 // HashTable is a hand-rolled hash table using separate chaining.
+//
+// It's parameterized over the value type (V) with Go generics rather than
+// hard-coded to *Value. That's not speculative "future-proofing" — it's
+// needed as of this stage: TTL tracking (see expiry.go) reuses this exact
+// same implementation for a second table mapping key -> expiry timestamp
+// (int64), instead of either duplicating the whole chaining/resizing
+// implementation or reaching for a builtin map. One well-tested hash table,
+// two instantiations: HashTable[*Value] for the main data table and
+// HashTable[int64] for the expiry index.
 //
 // IMPORTANT: HashTable itself is NOT safe for concurrent use. Thread safety
 // is deliberately layered on top by Store (internal/store/store.go) using a
@@ -43,14 +52,14 @@ type entry struct {
 //     pattern Go's own `map` uses: the map has no internal lock at all, and
 //     callers are expected to add one (or use sync.Map) if they need
 //     concurrent access.
-type HashTable struct {
-	buckets    []*entry
+type HashTable[V any] struct {
+	buckets    []*entry[V]
 	numEntries int
 }
 
 // Design constants for the resize policy.
 const (
-	initialCapacity  = 16  // must stay a power of two, see hashToIndex.
+	initialCapacity  = 16   // must stay a power of two, see hashToIndex.
 	maxLoadFactor    = 0.75 // grow when numEntries/capacity exceeds this.
 	growthMultiplier = 2
 )
@@ -58,9 +67,9 @@ const (
 // NewHashTable creates an empty hash table with a small power-of-two
 // starting capacity. Starting small keeps memory low for short-lived or
 // small stores; growth doubles capacity on demand (amortized O(1) insert).
-func NewHashTable() *HashTable {
-	return &HashTable{
-		buckets: make([]*entry, initialCapacity),
+func NewHashTable[V any]() *HashTable[V] {
+	return &HashTable[V]{
+		buckets: make([]*entry[V], initialCapacity),
 	}
 }
 
@@ -106,7 +115,7 @@ func hashToIndex(hash uint64, capacity int) int {
 // update to an existing key (false if it was a new insertion), which lets
 // callers (Store) track things like "was this a new key" without a second
 // lookup.
-func (h *HashTable) Set(key string, value *Value) bool {
+func (h *HashTable[V]) Set(key string, value V) bool {
 	index := hashToIndex(hashKey(key), len(h.buckets))
 
 	// Walk the chain first: if the key already exists, update in place
@@ -122,7 +131,7 @@ func (h *HashTable) Set(key string, value *Value) bool {
 	// because we don't need to walk to the end of the list — order within
 	// a bucket has no semantic meaning, so insertion position doesn't
 	// matter.
-	h.buckets[index] = &entry{key: key, value: value, next: h.buckets[index]}
+	h.buckets[index] = &entry[V]{key: key, value: value, next: h.buckets[index]}
 	h.numEntries++
 
 	// Resize check happens *after* insertion so the new entry is already
@@ -134,25 +143,26 @@ func (h *HashTable) Set(key string, value *Value) bool {
 }
 
 // Get looks up key and reports whether it was found.
-func (h *HashTable) Get(key string) (*Value, bool) {
+func (h *HashTable[V]) Get(key string) (V, bool) {
 	index := hashToIndex(hashKey(key), len(h.buckets))
 	for e := h.buckets[index]; e != nil; e = e.next {
 		if e.key == key {
 			return e.value, true
 		}
 	}
-	return nil, false
+	var zero V
+	return zero, false
 }
 
 // Delete removes key if present and reports whether anything was removed.
-func (h *HashTable) Delete(key string) bool {
+func (h *HashTable[V]) Delete(key string) bool {
 	index := hashToIndex(hashKey(key), len(h.buckets))
 
 	// Standard singly-linked-list deletion: track the previous node so we
 	// can splice the target out. Using a `prev` pointer here rather than a
 	// pointer-to-pointer keeps the logic readable, at the minor cost of one
 	// extra branch for the head-of-chain case.
-	var prev *entry
+	var prev *entry[V]
 	for e := h.buckets[index]; e != nil; e = e.next {
 		if e.key == key {
 			if prev == nil {
@@ -169,14 +179,14 @@ func (h *HashTable) Delete(key string) bool {
 }
 
 // Len returns the number of keys currently stored.
-func (h *HashTable) Len() int {
+func (h *HashTable[V]) Len() int {
 	return h.numEntries
 }
 
 // Keys returns a snapshot slice of every key in the table. Order is
 // unspecified (it depends on bucket layout), matching the semantics of
 // Go's own map iteration.
-func (h *HashTable) Keys() []string {
+func (h *HashTable[V]) Keys() []string {
 	keys := make([]string, 0, h.numEntries)
 	for _, head := range h.buckets {
 		for e := head; e != nil; e = e.next {
@@ -188,8 +198,13 @@ func (h *HashTable) Keys() []string {
 
 // ForEach calls fn for every key/value pair. Used by callers (e.g. active
 // expiry sweeps, snapshotting) that need to walk the whole table without
-// allocating an intermediate slice via Keys(). fn must not mutate the table.
-func (h *HashTable) ForEach(fn func(key string, value *Value)) {
+// allocating an intermediate slice via Keys(). fn must not mutate the table
+// (it's called while walking bucket chains directly; inserting or deleting
+// from within fn can corrupt the chain being walked — callers that need to
+// delete based on what they see should collect keys during ForEach and
+// delete them afterwards, which is exactly what the active expiry sweep
+// does).
+func (h *HashTable[V]) ForEach(fn func(key string, value V)) {
 	for _, head := range h.buckets {
 		for e := head; e != nil; e = e.next {
 			fn(e.key, e.value)
@@ -204,12 +219,12 @@ func (h *HashTable) ForEach(fn func(key string, value *Value)) {
 // everything" operation that's both simpler and faster: a large table that
 // grew to hold millions of keys shouldn't stay that large (and get walked
 // bucket-by-bucket) just to become empty again.
-func (h *HashTable) Clear() {
-	h.buckets = make([]*entry, initialCapacity)
+func (h *HashTable[V]) Clear() {
+	h.buckets = make([]*entry[V], initialCapacity)
 	h.numEntries = 0
 }
 
-func (h *HashTable) loadFactor() float64 {
+func (h *HashTable[V]) loadFactor() float64 {
 	return float64(h.numEntries) / float64(len(h.buckets))
 }
 
@@ -226,9 +241,9 @@ func (h *HashTable) loadFactor() float64 {
 // bit of CPU for simplicity — caching hashes alongside each entry would
 // avoid recomputation but add memory overhead and complexity that isn't
 // worth it at this scale.
-func (h *HashTable) resize() {
+func (h *HashTable[V]) resize() {
 	newCapacity := len(h.buckets) * growthMultiplier
-	newBuckets := make([]*entry, newCapacity)
+	newBuckets := make([]*entry[V], newCapacity)
 
 	for _, head := range h.buckets {
 		for e := head; e != nil; {

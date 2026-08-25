@@ -27,29 +27,50 @@ import "sync"
 // exclusive lock.
 type Store struct {
 	mu   sync.RWMutex
-	data *HashTable
+	data *HashTable[*Value]
+
+	// expires holds the absolute expiry time (Unix nanoseconds) for every
+	// key that has a TTL set. Keys with no TTL simply have no entry here —
+	// see expiry.go for the full rationale, but in short: this mirrors
+	// Redis's own design of keeping a separate "expires" dictionary rather
+	// than tagging every value with an (almost-always-unused) expiry
+	// field, so the active-expiry sweep only ever has to walk keys that
+	// can actually expire.
+	expires *HashTable[int64]
+
+	stopSweep chan struct{} // closed by Close() to signal the sweeper to exit.
+	sweepDone chan struct{} // closed by the sweeper goroutine once it has exited.
 }
 
-// New creates an empty Store.
+// New creates a Store with active background expiry running at the default
+// interval. Callers that need a different sweep cadence (tests, mainly)
+// should use NewWithSweepInterval.
 func New() *Store {
-	return &Store{data: NewHashTable()}
+	return NewWithSweepInterval(defaultSweepInterval)
 }
 
 // Set stores key as a string value, overwriting whatever was there before
 // (including a different type — like Redis, SET always succeeds and
-// replaces the key wholesale).
+// replaces the key wholesale). Like Redis's plain SET, this also clears any
+// TTL that was previously set on the key: a fresh value with no explicit
+// expiry is a fresh key, not a continuation of the old one's lifetime.
 func (s *Store) Set(key, value string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.data.Set(key, &Value{Type: TypeString, Str: value})
+	s.expires.Delete(key)
 }
 
 // Get returns the string value for key. found is false if the key doesn't
-// exist; err is ErrWrongType if the key holds a non-string value.
+// exist (or has lazily expired); err is ErrWrongType if the key holds a
+// non-string value.
 func (s *Store) Get(key string) (value string, found bool, err error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	if s.isExpired(key) {
+		return "", false, nil
+	}
 	v, ok := s.data.Get(key)
 	if !ok {
 		return "", false, nil
@@ -62,13 +83,17 @@ func (s *Store) Get(key string) (value string, found bool, err error) {
 
 // Del removes one or more keys and returns how many were actually present
 // (matching Redis's DEL semantics, which is variadic and returns a count).
+// A logically-expired-but-not-yet-swept key counts as absent, matching
+// what a client would observe from GET/EXISTS on that key.
 func (s *Store) Del(keys ...string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	removed := 0
 	for _, key := range keys {
-		if s.data.Delete(key) {
+		expired := s.isExpired(key)
+		s.expires.Delete(key)
+		if s.data.Delete(key) && !expired {
 			removed++
 		}
 	}
@@ -84,6 +109,9 @@ func (s *Store) Exists(keys ...string) int {
 
 	count := 0
 	for _, key := range keys {
+		if s.isExpired(key) {
+			continue
+		}
 		if _, ok := s.data.Get(key); ok {
 			count++
 		}
@@ -91,11 +119,20 @@ func (s *Store) Exists(keys ...string) int {
 	return count
 }
 
-// Keys returns a snapshot of every key currently in the store.
+// Keys returns a snapshot of every key currently in the store, excluding
+// keys that have lazily expired but haven't been physically swept yet.
 func (s *Store) Keys() []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.data.Keys()
+
+	all := s.data.Keys()
+	live := make([]string, 0, len(all))
+	for _, k := range all {
+		if !s.isExpired(k) {
+			live = append(live, k)
+		}
+	}
+	return live
 }
 
 // FlushAll removes every key, resetting the store to empty.
@@ -103,6 +140,7 @@ func (s *Store) FlushAll() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.data.Clear()
+	s.expires.Clear()
 }
 
 // LPush prepends one or more values to the list at key (creating the list
@@ -144,6 +182,9 @@ func (s *Store) LLen(key string) (int, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	if s.isExpired(key) {
+		return 0, nil
+	}
 	v, ok := s.data.Get(key)
 	if !ok {
 		return 0, nil
@@ -162,6 +203,9 @@ func (s *Store) LRange(key string, start, stop int) ([]string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	if s.isExpired(key) {
+		return []string{}, nil
+	}
 	v, ok := s.data.Get(key)
 	if !ok {
 		return []string{}, nil
@@ -192,8 +236,18 @@ func (s *Store) LRange(key string, start, stop int) ([]string, error) {
 }
 
 // getOrCreateList fetches key's list Value, creating a new empty one if the
-// key is absent. Caller must hold s.mu (write lock).
+// key is absent (or has lazily expired). Caller must hold s.mu (write
+// lock).
 func (s *Store) getOrCreateList(key string) (*Value, error) {
+	if s.isExpired(key) {
+		// We already hold the write lock for this key, so this is a good
+		// opportunity to physically reclaim the stale entry rather than
+		// waiting on the next active-sweep tick.
+		s.data.Delete(key)
+		s.expires.Delete(key)
+		return &Value{Type: TypeList}, nil
+	}
+
 	v, ok := s.data.Get(key)
 	if !ok {
 		return &Value{Type: TypeList}, nil
