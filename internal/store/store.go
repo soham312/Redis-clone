@@ -19,6 +19,7 @@ import "sync"
 //     snapshotting for persistence) — those would need to acquire every
 //     shard's lock anyway, which erases most of the benefit while adding
 //     real complexity.
+//
 // A single RWMutex is the simplest thing that is obviously correct, and
 // RWMutex specifically (not a plain Mutex) matters because GET is expected
 // to vastly outnumber SET/DEL in a typical workload: RWMutex lets any

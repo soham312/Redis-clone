@@ -18,6 +18,7 @@ package store
 //     fills up and *must* stay well under 1.0.
 //  3. It mirrors how Go's own runtime map is implemented (buckets of
 //     entries), so the mental model transfers directly.
+//
 // The tradeoff is pointer chasing (cache-unfriendly) and one extra word of
 // memory per entry for the `next` pointer — open addressing would win on
 // raw cache locality for small/simple value types.

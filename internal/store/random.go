@@ -19,6 +19,7 @@ import (
 //     touched in hours. For a workload with locality (some keys hot,
 //     most cold — the common case), that means a measurably worse cache
 //     hit rate.
+//
 // Random eviction genuinely wins when access patterns have *no* locality
 // (uniformly random key access), where LRU's bookkeeping buys nothing and
 // its extra per-access work is pure overhead — an edge case worth naming
