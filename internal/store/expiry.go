@@ -10,18 +10,37 @@ import "time"
 // lock+scan is negligible overhead.
 const defaultSweepInterval = 100 * time.Millisecond
 
-// NewWithSweepInterval creates a Store and immediately starts its
-// background active-expiry goroutine at the given interval. Exposed
-// separately from New() so tests can use a much shorter interval instead
-// of sleeping for 100ms+ per assertion.
+// New creates a Store with default config (no eviction limits, LRU
+// selected) and active background expiry running at the default interval.
+func New() *Store {
+	return NewWithOptions(DefaultConfig(), defaultSweepInterval)
+}
+
+// NewWithConfig creates a Store with the given resource-limit/eviction
+// config and active background expiry running at the default interval.
+func NewWithConfig(cfg Config) *Store {
+	return NewWithOptions(cfg, defaultSweepInterval)
+}
+
+// NewWithSweepInterval creates a Store with default config but a custom
+// active-expiry sweep interval. Exposed separately so tests can use a much
+// shorter interval instead of sleeping for 100ms+ per assertion.
 func NewWithSweepInterval(interval time.Duration) *Store {
+	return NewWithOptions(DefaultConfig(), interval)
+}
+
+// NewWithOptions is the full constructor; New/NewWithConfig/
+// NewWithSweepInterval are convenience wrappers around it.
+func NewWithOptions(cfg Config, sweepInterval time.Duration) *Store {
 	s := &Store{
 		data:      NewHashTable[*Value](),
 		expires:   NewHashTable[int64](),
+		cfg:       cfg,
+		policy:    newEvictionPolicy(cfg.EvictionPolicy),
 		stopSweep: make(chan struct{}),
 		sweepDone: make(chan struct{}),
 	}
-	go s.runActiveExpiry(interval)
+	go s.runActiveExpiry(sweepInterval)
 	return s
 }
 
@@ -103,8 +122,9 @@ func (s *Store) sweepExpiredKeys() {
 	})
 
 	for _, key := range expiredKeys {
-		s.data.Delete(key)
+		s.removeFromData(key)
 		s.expires.Delete(key)
+		s.policy.RemoveKey(key)
 	}
 }
 
@@ -150,8 +170,9 @@ func (s *Store) Expire(key string, ttl time.Duration) bool {
 		// Already logically gone; opportunistically reclaim it now that
 		// we hold the write lock, and report "key doesn't exist" like
 		// Redis does for EXPIRE on an already-expired key.
-		s.data.Delete(key)
+		s.removeFromData(key)
 		s.expires.Delete(key)
+		s.policy.RemoveKey(key)
 		return false
 	}
 

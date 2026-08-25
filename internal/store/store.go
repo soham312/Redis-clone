@@ -5,8 +5,8 @@ import "sync"
 // Store is the concurrency-safe, typed API on top of the raw HashTable.
 // This is the layer commands (and eventually the TCP server) talk to.
 //
-// A single sync.RWMutex guards the entire table for every operation. This
-// is a deliberate, coarse-grained choice over the alternatives:
+// A single sync.RWMutex guards the data table for every operation. This is
+// a deliberate, coarse-grained choice over the alternatives:
 //   - sync.Map was considered, but it's optimized for the "many goroutines,
 //     mostly-disjoint keys, rare writes" access pattern (its own docs say
 //     so). A key-value store gets read *and* written to the same hot keys
@@ -24,7 +24,8 @@ import "sync"
 // to vastly outnumber SET/DEL in a typical workload: RWMutex lets any
 // number of concurrent readers (goroutines running GET/EXISTS/KEYS) proceed
 // in parallel, and only blocks readers out while a writer holds the
-// exclusive lock.
+// exclusive lock. (Eviction bookkeeping has its own, separate lock — see
+// the EvictionPolicy doc comment in eviction.go for why.)
 type Store struct {
 	mu   sync.RWMutex
 	data *HashTable[*Value]
@@ -38,15 +39,16 @@ type Store struct {
 	// can actually expire.
 	expires *HashTable[int64]
 
+	cfg    Config
+	policy EvictionPolicy
+	// usedBytes is a running, approximate total of key+value content
+	// bytes, maintained incrementally on every mutation rather than
+	// recomputed by walking the table. See Config.MaxMemoryBytes for why
+	// it's approximate.
+	usedBytes int64
+
 	stopSweep chan struct{} // closed by Close() to signal the sweeper to exit.
 	sweepDone chan struct{} // closed by the sweeper goroutine once it has exited.
-}
-
-// New creates a Store with active background expiry running at the default
-// interval. Callers that need a different sweep cadence (tests, mainly)
-// should use NewWithSweepInterval.
-func New() *Store {
-	return NewWithSweepInterval(defaultSweepInterval)
 }
 
 // Set stores key as a string value, overwriting whatever was there before
@@ -57,8 +59,11 @@ func New() *Store {
 func (s *Store) Set(key, value string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.data.Set(key, &Value{Type: TypeString, Str: value})
+
+	s.replace(key, &Value{Type: TypeString, Str: value})
 	s.expires.Delete(key)
+	s.policy.Touch(key)
+	s.enforceLimits()
 }
 
 // Get returns the string value for key. found is false if the key doesn't
@@ -78,6 +83,13 @@ func (s *Store) Get(key string) (value string, found bool, err error) {
 	if v.Type != TypeString {
 		return "", false, ErrWrongType
 	}
+
+	// Recording recency here — while only holding the *read* lock on the
+	// data table — is exactly why EvictionPolicy implementations manage
+	// their own internal mutex instead of sharing s.mu: this call mutates
+	// the LRU list, but does so under lruPolicy's own lock, so it doesn't
+	// need (and mustn't take) s.mu for writing.
+	s.policy.Touch(key)
 	return v.Str, true, nil
 }
 
@@ -93,7 +105,7 @@ func (s *Store) Del(keys ...string) int {
 	for _, key := range keys {
 		expired := s.isExpired(key)
 		s.expires.Delete(key)
-		if s.data.Delete(key) && !expired {
+		if s.removeFromData(key) && !expired {
 			removed++
 		}
 	}
@@ -139,8 +151,11 @@ func (s *Store) Keys() []string {
 func (s *Store) FlushAll() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	s.data.Clear()
 	s.expires.Clear()
+	s.policy.Clear()
+	s.usedBytes = 0
 }
 
 // LPush prepends one or more values to the list at key (creating the list
@@ -158,7 +173,9 @@ func (s *Store) LPush(key string, values ...string) (int, error) {
 	for _, v := range values {
 		list.List = append([]string{v}, list.List...)
 	}
-	s.data.Set(key, list)
+	s.replace(key, list)
+	s.policy.Touch(key)
+	s.enforceLimits()
 	return len(list.List), nil
 }
 
@@ -173,7 +190,9 @@ func (s *Store) RPush(key string, values ...string) (int, error) {
 		return 0, err
 	}
 	list.List = append(list.List, values...)
-	s.data.Set(key, list)
+	s.replace(key, list)
+	s.policy.Touch(key)
+	s.enforceLimits()
 	return len(list.List), nil
 }
 
@@ -192,6 +211,7 @@ func (s *Store) LLen(key string) (int, error) {
 	if v.Type != TypeList {
 		return 0, ErrWrongType
 	}
+	s.policy.Touch(key)
 	return len(v.List), nil
 }
 
@@ -213,6 +233,7 @@ func (s *Store) LRange(key string, start, stop int) ([]string, error) {
 	if v.Type != TypeList {
 		return nil, ErrWrongType
 	}
+	s.policy.Touch(key)
 
 	n := len(v.List)
 	start = normalizeIndex(start, n)
@@ -243,8 +264,9 @@ func (s *Store) getOrCreateList(key string) (*Value, error) {
 		// We already hold the write lock for this key, so this is a good
 		// opportunity to physically reclaim the stale entry rather than
 		// waiting on the next active-sweep tick.
-		s.data.Delete(key)
+		s.removeFromData(key)
 		s.expires.Delete(key)
+		s.policy.RemoveKey(key)
 		return &Value{Type: TypeList}, nil
 	}
 
@@ -256,6 +278,86 @@ func (s *Store) getOrCreateList(key string) (*Value, error) {
 		return nil, ErrWrongType
 	}
 	return v, nil
+}
+
+// entrySize is the approximate byte cost attributed to one key/value pair
+// for MaxMemoryBytes accounting — see Config.MaxMemoryBytes for what this
+// deliberately does and doesn't count.
+func entrySize(key string, v *Value) int64 {
+	size := int64(len(key))
+	switch v.Type {
+	case TypeString:
+		size += int64(len(v.Str))
+	case TypeList:
+		for _, e := range v.List {
+			size += int64(len(e))
+		}
+	}
+	return size
+}
+
+// replace writes newValue for key, keeping usedBytes correct by first
+// subtracting whatever key previously cost (if anything). Caller must hold
+// s.mu (write lock).
+func (s *Store) replace(key string, newValue *Value) {
+	if old, ok := s.data.Get(key); ok {
+		s.usedBytes -= entrySize(key, old)
+	}
+	s.data.Set(key, newValue)
+	s.usedBytes += entrySize(key, newValue)
+}
+
+// removeFromData deletes key from the data table (only — callers are
+// responsible for also cleaning up s.expires / s.policy as appropriate)
+// and keeps usedBytes correct. Reports whether key was actually present.
+// Caller must hold s.mu (write lock).
+func (s *Store) removeFromData(key string) bool {
+	v, ok := s.data.Get(key)
+	if !ok {
+		return false
+	}
+	s.usedBytes -= entrySize(key, v)
+	s.data.Delete(key)
+	return true
+}
+
+// overLimit reports whether the store currently exceeds a configured
+// resource limit. Caller must hold s.mu (write lock).
+func (s *Store) overLimit() bool {
+	if s.cfg.MaxKeys > 0 && s.data.Len() > s.cfg.MaxKeys {
+		return true
+	}
+	if s.cfg.MaxMemoryBytes > 0 && s.usedBytes > s.cfg.MaxMemoryBytes {
+		return true
+	}
+	return false
+}
+
+// enforceLimits evicts keys, one at a time via the configured
+// EvictionPolicy, until the store is back within its configured limits (or
+// the policy runs out of keys to suggest, which shouldn't happen in
+// practice: every key Set/LPush/RPush touches is also handed to
+// s.policy.Touch in the same critical section, so the policy's tracked set
+// and s.data's key set never drift apart under normal operation).
+//
+// Called at the end of every write path that can grow the store
+// (Set/LPush/RPush), while still holding s.mu — eviction must be atomic
+// with the write that triggered it, or a burst of concurrent writers could
+// all observe "over limit" and each evict, overshooting well below the
+// configured limit.
+func (s *Store) enforceLimits() {
+	for s.overLimit() {
+		key, ok := s.policy.Evict()
+		if !ok {
+			return
+		}
+		// The policy is a best-effort suggestion, not the source of
+		// truth — always go through removeFromData so usedBytes/data.Len
+		// stay correct even if the key had already been removed some
+		// other way.
+		s.removeFromData(key)
+		s.expires.Delete(key)
+	}
 }
 
 // normalizeIndex converts a possibly-negative Redis-style index (-1 = last
